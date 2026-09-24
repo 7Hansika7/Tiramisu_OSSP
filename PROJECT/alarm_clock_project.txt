@@ -1,0 +1,775 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <errno.h>
+#include <time.h>
+
+#define MAX_MESSAGE 256
+#define LOG_FILE "alarm.log"
+
+typedef enum {
+    ALARM_ACTIVE,
+    ALARM_FIRED,
+    ALARM_CANCELLED
+} AlarmStatus;
+
+typedef struct Alarm {
+    int id;
+    pid_t pid;
+    unsigned int seconds;
+    char message[MAX_MESSAGE];
+    char time_text[16];
+    AlarmStatus status;
+    time_t created_at;
+    time_t fire_at;
+    struct Alarm *next;
+} Alarm;
+
+Alarm *alarm_list = NULL;
+
+pthread_mutex_t alarm_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t alarm_cond = PTHREAD_COND_INITIALIZER;
+
+volatile sig_atomic_t child_alarm_triggered = 0;
+
+char child_message[MAX_MESSAGE];
+int child_alarm_id = 0;
+
+int log_fd = -1;
+int next_id = 1;
+int running = 1;
+
+static void write_log(const char *event)
+{
+    if (log_fd != -1)
+        write(log_fd, event, strlen(event));
+}
+
+static void get_time_string(time_t t, char *buffer, size_t size)
+{
+    struct tm tm_info;
+
+    localtime_r(&t, &tm_info);
+
+    strftime(
+        buffer,
+        size,
+        "%Y-%m-%d %H:%M:%S",
+        &tm_info
+    );
+}
+
+static void log_alarm_event(
+    const char *event,
+    int id,
+    pid_t pid,
+    const char *message
+)
+{
+    char buffer[512];
+    char time_buffer[64];
+
+    get_time_string(time(NULL), time_buffer, sizeof(time_buffer));
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "[%s] %s | ID=%d | PID=%d | Message=%s\n",
+        time_buffer,
+        event,
+        id,
+        (int)pid,
+        message
+    );
+
+    write_log(buffer);
+}
+
+static void sigalrm_handler(int signal_number)
+{
+    (void)signal_number;
+
+    child_alarm_triggered = 1;
+}
+
+static void play_alarm_sound(void)
+{
+    pid_t sound_pid = fork();
+
+    if (sound_pid == 0) {
+        execlp(
+            "paplay",
+            "paplay",
+            "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
+            (char *)NULL
+        );
+
+        execlp(
+            "aplay",
+            "aplay",
+            "/usr/share/sounds/alsa/Front_Center.wav",
+            (char *)NULL
+        );
+
+        _exit(EXIT_FAILURE);
+    }
+}
+
+static void child_alarm_process(
+    unsigned int seconds,
+    int alarm_id,
+    const char *message
+)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+
+    strncpy(
+        child_message,
+        message,
+        MAX_MESSAGE - 1
+    );
+
+    child_message[MAX_MESSAGE - 1] = '\0';
+
+    child_alarm_id = alarm_id;
+
+    sa.sa_handler = sigalrm_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+
+    if (sigaction(SIGALRM, &sa, NULL) == -1)
+        _exit(EXIT_FAILURE);
+
+    alarm(seconds);
+
+    while (!child_alarm_triggered)
+        pause();
+
+    printf(
+        "\n\n"
+        "╔══════════════════════════════════════════╗\n"
+        "║              ⏰ ALARM RINGING             ║\n"
+        "╠══════════════════════════════════════════╣\n"
+        "║ Alarm ID : %-29d║\n"
+        "║ Message  : %-29s║\n"
+        "╚══════════════════════════════════════════╝\n",
+        child_alarm_id,
+        child_message
+    );
+
+    fflush(stdout);
+
+    printf("\a\a\a");
+    fflush(stdout);
+
+    play_alarm_sound();
+
+    _exit(EXIT_SUCCESS);
+}
+
+static Alarm *find_alarm(int id)
+{
+    Alarm *current = alarm_list;
+
+    while (current != NULL) {
+        if (current->id == id)
+            return current;
+
+        current = current->next;
+    }
+
+    return NULL;
+}
+
+static void add_alarm(Alarm *new_alarm)
+{
+    new_alarm->next = alarm_list;
+    alarm_list = new_alarm;
+}
+
+static void print_alarms(void)
+{
+    Alarm *current;
+    int count = 0;
+
+    pthread_mutex_lock(&alarm_mutex);
+
+    current = alarm_list;
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════════╗\n");
+    printf("║                        ACTIVE ALARMS                            ║\n");
+    printf("╠══════╦══════════╦══════════════╦════════════════════════════════╣\n");
+    printf("║ ID   ║ PID      ║ TIME         ║ MESSAGE                        ║\n");
+    printf("╠══════╬══════════╬══════════════╬════════════════════════════════╣\n");
+
+    while (current != NULL) {
+        if (current->status == ALARM_ACTIVE) {
+            printf(
+                "║ %-4d ║ %-8d ║ %-12s ║ %-30s ║\n",
+                current->id,
+                (int)current->pid,
+                current->time_text,
+                current->message
+            );
+
+            count++;
+        }
+
+        current = current->next;
+    }
+
+    if (count == 0) {
+        printf(
+            "║                 No active alarms.                              ║\n"
+        );
+    }
+
+    printf("╚══════╩══════════╩══════════════╩════════════════════════════════╝\n");
+
+    pthread_mutex_unlock(&alarm_mutex);
+}
+
+static void *alarm_monitor(void *arg)
+{
+    (void)arg;
+
+    while (running) {
+        int status;
+        pid_t pid;
+
+        pid = waitpid(-1, &status, WNOHANG);
+
+        if (pid > 0) {
+            pthread_mutex_lock(&alarm_mutex);
+
+            Alarm *current = alarm_list;
+
+            while (current != NULL) {
+                if (current->pid == pid) {
+                    if (current->status == ALARM_ACTIVE) {
+                        current->status = ALARM_FIRED;
+
+                        log_alarm_event(
+                            "ALARM FIRED",
+                            current->id,
+                            current->pid,
+                            current->message
+                        );
+                    }
+
+                    break;
+                }
+
+                current = current->next;
+            }
+
+            pthread_cond_broadcast(&alarm_cond);
+
+            pthread_mutex_unlock(&alarm_mutex);
+        }
+
+        usleep(100000);
+    }
+
+    return NULL;
+}
+
+static void cleanup_finished_alarms(void)
+{
+    Alarm *current;
+    Alarm *previous;
+    Alarm *next;
+
+    pthread_mutex_lock(&alarm_mutex);
+
+    current = alarm_list;
+    previous = NULL;
+
+    while (current != NULL) {
+        next = current->next;
+
+        if (current->status == ALARM_FIRED ||
+            current->status == ALARM_CANCELLED) {
+
+            if (previous == NULL)
+                alarm_list = next;
+            else
+                previous->next = next;
+
+            free(current);
+        } else {
+            previous = current;
+        }
+
+        current = next;
+    }
+
+    pthread_mutex_unlock(&alarm_mutex);
+}
+
+static int calculate_seconds_until_time(
+    int hour,
+    int minute,
+    time_t *fire_time
+)
+{
+    time_t now;
+    struct tm target;
+    time_t target_time;
+    long difference;
+
+    now = time(NULL);
+
+    localtime_r(&now, &target);
+
+    target.tm_hour = hour;
+    target.tm_min = minute;
+    target.tm_sec = 0;
+
+    target_time = mktime(&target);
+
+    if (target_time <= now) {
+        target.tm_mday++;
+        target_time = mktime(&target);
+    }
+
+    difference = (long)difftime(target_time, now);
+
+    if (difference <= 0)
+        return -1;
+
+    *fire_time = target_time;
+
+    return (int)difference;
+}
+
+static int read_message(char *message)
+{
+    printf("Enter message: ");
+
+    if (fgets(message, MAX_MESSAGE, stdin) == NULL)
+        return 0;
+
+    message[strcspn(message, "\n")] = '\0';
+
+    if (strlen(message) == 0)
+        strcpy(message, "Alarm!");
+
+    return 1;
+}
+
+static void create_alarm(
+    unsigned int seconds,
+    time_t fire_time,
+    const char *time_text
+)
+{
+    char message[MAX_MESSAGE];
+    Alarm *new_alarm;
+    pid_t pid;
+
+    if (!read_message(message))
+        return;
+
+    new_alarm = malloc(sizeof(Alarm));
+
+    if (new_alarm == NULL) {
+        perror("malloc");
+        return;
+    }
+
+    memset(new_alarm, 0, sizeof(Alarm));
+
+    new_alarm->id = next_id++;
+    new_alarm->seconds = seconds;
+    new_alarm->status = ALARM_ACTIVE;
+    new_alarm->created_at = time(NULL);
+    new_alarm->fire_at = fire_time;
+
+    strncpy(
+        new_alarm->message,
+        message,
+        MAX_MESSAGE - 1
+    );
+
+    new_alarm->message[MAX_MESSAGE - 1] = '\0';
+
+    strncpy(
+        new_alarm->time_text,
+        time_text,
+        sizeof(new_alarm->time_text) - 1
+    );
+
+    new_alarm->time_text[
+        sizeof(new_alarm->time_text) - 1
+    ] = '\0';
+
+    pid = fork();
+
+    if (pid < 0) {
+        perror("fork");
+        free(new_alarm);
+        return;
+    }
+
+    if (pid == 0) {
+        child_alarm_process(
+            seconds,
+            new_alarm->id,
+            new_alarm->message
+        );
+    }
+
+    new_alarm->pid = pid;
+
+    pthread_mutex_lock(&alarm_mutex);
+
+    add_alarm(new_alarm);
+
+    pthread_cond_signal(&alarm_cond);
+
+    pthread_mutex_unlock(&alarm_mutex);
+
+    log_alarm_event(
+        "ALARM CREATED",
+        new_alarm->id,
+        new_alarm->pid,
+        new_alarm->message
+    );
+
+    printf("\n");
+    printf("┌──────────────────────────────────────────┐\n");
+    printf("│           ALARM SET SUCCESSFULLY         │\n");
+    printf("├──────────────────────────────────────────┤\n");
+    printf("│ Alarm ID : %-29d │\n", new_alarm->id);
+    printf("│ PID      : %-29d │\n", (int)new_alarm->pid);
+    printf("│ Time     : %-29s │\n", new_alarm->time_text);
+    printf("│ Message  : %-29s │\n", new_alarm->message);
+    printf("└──────────────────────────────────────────┘\n");
+}
+
+static void set_delay_alarm(void)
+{
+    char input[64];
+    unsigned int seconds;
+    time_t fire_time;
+    char time_text[16];
+
+    printf("\n");
+    printf("========== SET DELAY ALARM ==========\n");
+
+    printf("Enter delay in seconds: ");
+
+    if (fgets(input, sizeof(input), stdin) == NULL)
+        return;
+
+    seconds = (unsigned int)strtoul(input, NULL, 10);
+
+    if (seconds == 0) {
+        printf("Invalid delay.\n");
+        return;
+    }
+
+    fire_time = time(NULL) + seconds;
+
+    get_time_string(
+        fire_time,
+        time_text,
+        sizeof(time_text)
+    );
+
+    create_alarm(
+        seconds,
+        fire_time,
+        time_text
+    );
+}
+
+static void set_time_alarm(void)
+{
+    char input[64];
+    int hour;
+    int minute;
+    int seconds;
+    time_t fire_time;
+    char time_text[16];
+
+    printf("\n");
+    printf("========== SET TIME ALARM ==========\n");
+
+    printf("Enter alarm time (HH:MM): ");
+
+    if (fgets(input, sizeof(input), stdin) == NULL)
+        return;
+
+    if (sscanf(input, "%d:%d", &hour, &minute) != 2) {
+        printf("Invalid time format. Use HH:MM.\n");
+        return;
+    }
+
+    if (hour < 0 || hour > 23 ||
+        minute < 0 || minute > 59) {
+
+        printf("Invalid time. Use 00:00 to 23:59.\n");
+        return;
+    }
+
+    seconds = calculate_seconds_until_time(
+        hour,
+        minute,
+        &fire_time
+    );
+
+    if (seconds <= 0) {
+        printf("Could not calculate alarm time.\n");
+        return;
+    }
+
+    snprintf(
+        time_text,
+        sizeof(time_text),
+        "%02d:%02d",
+        hour,
+        minute
+    );
+
+    printf(
+        "Alarm scheduled for %s.\n",
+        time_text
+    );
+
+    create_alarm(
+        (unsigned int)seconds,
+        fire_time,
+        time_text
+    );
+}
+
+static void cancel_alarm(void)
+{
+    int id;
+    char input[64];
+
+    pthread_mutex_lock(&alarm_mutex);
+
+    if (alarm_list == NULL) {
+        pthread_mutex_unlock(&alarm_mutex);
+        printf("\nNo active alarms to cancel.\n");
+        return;
+    }
+
+    pthread_mutex_unlock(&alarm_mutex);
+
+    print_alarms();
+
+    printf("\nEnter alarm ID to cancel: ");
+
+    if (fgets(input, sizeof(input), stdin) == NULL)
+        return;
+
+    id = atoi(input);
+
+    pthread_mutex_lock(&alarm_mutex);
+
+    Alarm *alarm = find_alarm(id);
+
+    if (alarm == NULL) {
+        pthread_mutex_unlock(&alarm_mutex);
+        printf("Alarm ID not found.\n");
+        return;
+    }
+
+    if (alarm->status != ALARM_ACTIVE) {
+        pthread_mutex_unlock(&alarm_mutex);
+        printf("Alarm is no longer active.\n");
+        return;
+    }
+
+    if (kill(alarm->pid, SIGTERM) == -1) {
+        if (errno != ESRCH) {
+            perror("kill");
+            pthread_mutex_unlock(&alarm_mutex);
+            return;
+        }
+    }
+
+    alarm->status = ALARM_CANCELLED;
+
+    log_alarm_event(
+        "ALARM CANCELLED",
+        alarm->id,
+        alarm->pid,
+        alarm->message
+    );
+
+    pthread_cond_broadcast(&alarm_cond);
+
+    pthread_mutex_unlock(&alarm_mutex);
+
+    waitpid(alarm->pid, NULL, 0);
+
+    printf(
+        "\nAlarm ID %d cancelled successfully.\n",
+        id
+    );
+}
+
+static void print_menu(void)
+{
+    printf("\n");
+    printf("╔══════════════════════════════════════════╗\n");
+    printf("║            ALARM CLOCK SYSTEM            ║\n");
+    printf("╠══════════════════════════════════════════╣\n");
+    printf("║ 1. Set Alarm After Delay                 ║\n");
+    printf("║ 2. Set Alarm at Specific Time            ║\n");
+    printf("║ 3. Cancel Alarm                          ║\n");
+    printf("║ 4. View Active Alarms                    ║\n");
+    printf("║ 5. Exit                                  ║\n");
+    printf("╚══════════════════════════════════════════╝\n");
+    printf("Enter choice: ");
+}
+
+static void cleanup_all(void)
+{
+    Alarm *current;
+    Alarm *next;
+
+    pthread_mutex_lock(&alarm_mutex);
+
+    current = alarm_list;
+
+    while (current != NULL) {
+        if (current->status == ALARM_ACTIVE)
+            kill(current->pid, SIGTERM);
+
+        current = current->next;
+    }
+
+    pthread_mutex_unlock(&alarm_mutex);
+
+    current = alarm_list;
+
+    while (current != NULL) {
+        next = current->next;
+
+        waitpid(current->pid, NULL, 0);
+
+        current = next;
+    }
+
+    pthread_mutex_lock(&alarm_mutex);
+
+    while (alarm_list != NULL) {
+        Alarm *temp = alarm_list;
+
+        alarm_list = alarm_list->next;
+
+        free(temp);
+    }
+
+    pthread_mutex_unlock(&alarm_mutex);
+}
+
+int main(void)
+{
+    pthread_t monitor_thread;
+    char input[64];
+    int choice;
+
+    log_fd = open(
+        LOG_FILE,
+        O_WRONLY | O_CREAT | O_APPEND,
+        0644
+    );
+
+    if (log_fd == -1) {
+        perror("open");
+        return EXIT_FAILURE;
+    }
+
+    write_log(
+        "\n========== ALARM CLOCK STARTED ==========\n"
+    );
+
+    if (pthread_create(
+            &monitor_thread,
+            NULL,
+            alarm_monitor,
+            NULL
+        ) != 0) {
+
+        perror("pthread_create");
+        close(log_fd);
+        return EXIT_FAILURE;
+    }
+
+    while (running) {
+        cleanup_finished_alarms();
+
+        print_menu();
+
+        if (fgets(input, sizeof(input), stdin) == NULL)
+            break;
+
+        choice = atoi(input);
+
+        switch (choice) {
+            case 1:
+                set_delay_alarm();
+                break;
+
+            case 2:
+                set_time_alarm();
+                break;
+
+            case 3:
+                cancel_alarm();
+                break;
+
+            case 4:
+                print_alarms();
+                break;
+
+            case 5:
+                running = 0;
+                break;
+
+            default:
+                printf(
+                    "\nInvalid choice. Please enter 1-5.\n"
+                );
+        }
+    }
+
+    running = 0;
+
+    pthread_cond_broadcast(&alarm_cond);
+
+    pthread_join(monitor_thread, NULL);
+
+    cleanup_all();
+
+    write_log(
+        "========== ALARM CLOCK TERMINATED ==========\n"
+    );
+
+    close(log_fd);
+
+    pthread_mutex_destroy(&alarm_mutex);
+    pthread_cond_destroy(&alarm_cond);
+
+    printf(
+        "\nAlarm Clock terminated successfully.\n"
+    );
+
+    return 0;
+}
