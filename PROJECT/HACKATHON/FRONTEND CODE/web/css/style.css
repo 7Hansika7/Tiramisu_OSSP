@@ -1,0 +1,333 @@
+/*
+ * Linux Process Tree Visualizer - Design System & Custom Styles
+ * -------------------------------------------------------------
+ * Clean dark-mode telemetry aesthetic, high-contrast states,
+ * smooth SVG tree connectors, and glassmorphism panels.
+ */
+
+:root {
+  --bg-primary: #080b11;
+  --bg-secondary: #0d131f;
+  --bg-tertiary: #162032;
+  --bg-card: rgba(16, 24, 40, 0.75);
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --border-medium: rgba(255, 255, 255, 0.15);
+  --border-accent: rgba(56, 189, 248, 0.4);
+  
+  --text-main: #f1f5f9;
+  --text-muted: #94a3b8;
+  --text-dim: #64748b;
+  
+  --state-r: #10b981; /* Running - Emerald */
+  --state-s: #38bdf8; /* Sleeping - Sky */
+  --state-d: #06b6d4; /* Disk Sleep - Cyan */
+  --state-t: #f59e0b; /* Stopped - Amber */
+  --state-z: #ef4444; /* Zombie - Crimson */
+  --state-k: #a855f7; /* Kernel - Violet */
+  
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, monospace;
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-main);
+  font-family: var(--font-sans);
+  overflow-x: hidden;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-primary);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-medium);
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+/* Glass panel */
+.glass-panel {
+  background: var(--bg-card);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+}
+
+/* Pulse animation for running state */
+@keyframes pulse-ring {
+  0% { transform: scale(0.95); opacity: 0.8; }
+  50% { transform: scale(1.25); opacity: 0.3; }
+  100% { transform: scale(0.95); opacity: 0.8; }
+}
+
+.pulse-running {
+  animation: pulse-ring 2s infinite ease-in-out;
+}
+
+@keyframes pulse-danger {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+  50% { box-shadow: 0 0 16px 4px rgba(239, 68, 68, 0.7); }
+}
+
+.pulse-zombie {
+  animation: pulse-danger 1.5s infinite;
+}
+
+/* D3 Tree View Styling */
+.tree-container {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+  background: radial-gradient(circle at 50% 50%, rgba(13, 19, 31, 0.8) 0%, rgba(8, 11, 17, 1) 100%);
+}
+
+.tree-link {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.12);
+  stroke-width: 1.5px;
+  transition: stroke 0.25s, stroke-width 0.25s, opacity 0.25s;
+}
+
+.tree-link.highlighted {
+  stroke: #38bdf8;
+  stroke-width: 2.5px;
+  opacity: 1;
+  filter: drop-shadow(0 0 4px rgba(56, 189, 248, 0.6));
+}
+
+.tree-link.dimmed {
+  opacity: 0.15;
+}
+
+/* Node card styling in SVG */
+.node-card {
+  cursor: pointer;
+  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.node-card:hover {
+  filter: drop-shadow(0 4px 14px rgba(0, 0, 0, 0.6));
+}
+
+.node-card.selected rect.node-box {
+  stroke: #38bdf8;
+  stroke-width: 2px;
+  filter: drop-shadow(0 0 10px rgba(56, 189, 248, 0.4));
+}
+
+.node-card.dimmed {
+  opacity: 0.2;
+}
+
+.node-box {
+  fill: #0f172a;
+  stroke: rgba(255, 255, 255, 0.1);
+  stroke-width: 1px;
+  rx: 6px;
+  ry: 6px;
+  transition: all 0.2s;
+}
+
+.node-box:hover {
+  stroke: rgba(255, 255, 255, 0.3);
+}
+
+/* Terminal View Styling */
+.terminal-window {
+  background: #05070b;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.6;
+  color: #e2e8f0;
+  overflow: auto;
+  height: 100%;
+  padding: 16px;
+  user-select: text;
+}
+
+.term-line {
+  white-space: pre;
+  display: flex;
+  align-items: center;
+  border-radius: 4px;
+  padding: 2px 4px;
+  transition: background 0.15s;
+}
+
+.term-line:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.term-branch {
+  color: #475569;
+  user-select: none;
+}
+
+.term-name {
+  font-weight: 600;
+  color: #f8fafc;
+}
+
+.term-meta {
+  color: #64748b;
+  font-size: 11px;
+  margin-left: 8px;
+}
+
+/* Badges for states */
+.state-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+
+.state-pill.state-R {
+  background: rgba(16, 185, 129, 0.15);
+  color: #10b981;
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.state-pill.state-S {
+  background: rgba(56, 189, 248, 0.12);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.25);
+}
+
+.state-pill.state-T {
+  background: rgba(245, 158, 11, 0.15);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.state-pill.state-Z {
+  background: rgba(239, 68, 68, 0.2);
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+}
+
+.state-pill.state-D {
+  background: rgba(6, 182, 212, 0.15);
+  color: #06b6d4;
+  border: 1px solid rgba(6, 182, 212, 0.3);
+}
+
+/* Tabs */
+.view-tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.view-tab:hover {
+  color: var(--text-main);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.view-tab.active {
+  color: #38bdf8;
+  border-bottom-color: #38bdf8;
+  background: rgba(56, 189, 248, 0.05);
+}
+
+/* Inspector Drawer */
+.inspector-drawer {
+  position: fixed;
+  top: 0;
+  right: -480px;
+  width: 460px;
+  height: 100vh;
+  background: #0b101b;
+  border-left: 1px solid var(--border-medium);
+  box-shadow: -8px 0 32px rgba(0, 0, 0, 0.7);
+  transition: right 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+}
+
+.inspector-drawer.open {
+  right: 0;
+}
+
+/* Table styling */
+.process-table-container {
+  overflow: auto;
+  height: 100%;
+}
+
+.process-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 13px;
+}
+
+.process-table th {
+  background: #0c121e;
+  color: var(--text-dim);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-medium);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.process-table td {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-main);
+}
+
+.process-table tr:hover td {
+  background: rgba(255, 255, 255, 0.03);
+  cursor: pointer;
+}
+
+/* Grid background pattern */
+.grid-bg {
+  background-image: 
+    linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
